@@ -1,6 +1,6 @@
 # myPartitionManager
-mysql partition manager
-- RANGE Partitioning : monthly
+mysql monthly partition manager
+- RANGE Partitioning 
   - based on the value of a TIMESTAMP column
   - partioning_key_function : Date or Time (default:UNIX_TIMESTAMP()) function
 - RANGE COLUMNS partitioning supports
