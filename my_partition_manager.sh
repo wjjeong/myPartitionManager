@@ -2,13 +2,17 @@
 # range partition : test.userlogs
 usage() {
     echo "Usage: $0 -d <dbname> -t <tablename> -r month|day|week [-x <expire_unit>] [-a <add_unit>] [-p <partition_prefix>] [-f <partitioning_key_function>]"
-    echo "An expire/add unit is based on your range type. " 
+    echo "An expire/add unit is based on your range type. "
     exit 1
 }
 
 PAR_PREFIX='p'
-PAR_FUNC='UNIX_TIMESTAMP'
-while getopts ":d:t:r:x:a:p:f:" arg; do
+#PAR_FUNC='UNIX_TIMESTAMP'
+PAR_FUNC=""
+CUR_YM=`date +"%Y-%m"`
+NEXT_YM=`date --date 'Next-month' +"%Y-%m"`
+EXEC_MODE='EXEC'
+while getopts ":d:t:r:x:a:p:f:m:" arg; do
   case $arg in
       d) DB_NAME=${OPTARG}
          ;;
@@ -25,6 +29,8 @@ while getopts ":d:t:r:x:a:p:f:" arg; do
       p) PAR_PREFIX=${OPTARG}
          ;;
       f) PAR_FUNC=${OPTARG}
+         ;;
+      m) EXEC_MODE=${OPTARG}
          ;;
       \?) echo "Invalid option: -$OPTARG" >&2
           exit 1
@@ -46,11 +52,11 @@ if [ -z "$EXPIRE_UNITS"  -a -z "$ADD_UNITS" ]; then
 fi
 
 
-MYSQL_HOME=/mysql/MyHome
+MYSQL_HOME=/mysql
 MYSQL_HOST=127.0.0.1
-MYSQL_PORT=20306
+MYSQL_PORT=3306
 MYSQL_USER=root
-MYSQL_PASS='xxxx'
+MYSQL_PASS='root'
 
 
 ## -------------------------------------------------------------------------------------
@@ -92,16 +98,16 @@ PARTITION_NOT_EXISTS=`${MYSQL_HOME}/bin/mysql --user="${MYSQL_USER}" --password=
 #echo $PARTITION_NOT_EXISTS
 exit_if_error ${PARTITION_NOT_EXISTS} "Partition Table does not exists: <${PARTITION_NOT_EXISTS}> $QUERY_TO_CHECK"
 
-## RANGE_TYPE and Variables 
+## RANGE_TYPE and Variables
 if [ $RANGE_TYPE = 'month' ]; then
-	expr_to_create="DATE_FORMAT(cal.date - INTERVAL 1 MONTH, '%Y%m')"
-	expr_high="DATE_FORMAT(cal.date,'%Y-%m-01')"
+        expr_to_create="DATE_FORMAT(cal.date - INTERVAL 1 MONTH, '%Y%m')"
+        expr_high="DATE_FORMAT(cal.date,'%Y-%m-01')"
 elif [ $RANGE_TYPE = 'week' ]; then
-	expr_to_create="DATE_FORMAT(cal.date - interval 1 WEEK - interval weekday(cal.date) DAY, '%Y%m%d')"
-	expr_high="DATE_FORMAT(cal.date  - interval weekday(cal.date) day,'%Y-%m-%d')"
+        expr_to_create="DATE_FORMAT(cal.date - interval 1 WEEK - interval weekday(cal.date) DAY, '%Y%m%d')"
+        expr_high="DATE_FORMAT(cal.date  - interval weekday(cal.date) day,'%Y-%m-%d')"
 elif [ $RANGE_TYPE = 'day' ]; then
-	expr_to_create="DATE_FORMAT(cal.date - interval 1 DAY, '%Y%m%d')"
-	expr_high="DATE_FORMAT(cal.date,'%Y-%m-%d')"
+        expr_to_create="DATE_FORMAT(cal.date - interval 1 DAY, '%Y%m%d')"
+        expr_high="DATE_FORMAT(cal.date,'%Y-%m-%d')"
 fi
 
 ## CHECK PARTITION TO CREATE OR DROP
@@ -126,20 +132,23 @@ LEFT JOIN
 on ${PAR_FUNC}($expr_high) = t.partition_description
 "
 #### WHERE CONDITION, SUPPORT RANGE COLUMNS
-  if [ ${PAR_FUNC^^} == 'QUOTE' ]; then
+if [ -z $PAR_FUNC ]; then
     QUERY_TO_GET_PARTITION_TO_ADD+="
-where t.partition_name IS NULL AND ($expr_high) between  (select str_to_date(max(partition_description),'\'%Y-%m-%d\'') as max_value FROM information_schema.partitions  WHERE table_schema='${DB_NAME}' AND table_name='${TABLE_NAME}') and (NOW() + INTERVAL ${ADD_UNITS} $RANGE_TYPE)
+where t.partition_name IS NULL AND ($expr_high) >  (select str_to_date(max(partition_description),'\'%Y-%m-%d\'') as max_value FROM information_schema.partitions  WHERE table_schema='${DB_NAME}' AND table_name='${TABLE_NAME}' AND partition_description <>'MAXVALUE') and ($expr_high) <= (NOW() + INTERVAL ${ADD_UNITS} $RANGE_TYPE)
 ORDER BY 1, 2, 3
 "
   else
     QUERY_TO_GET_PARTITION_TO_ADD+="
-where t.partition_name IS NULL AND ${PAR_FUNC}($expr_high) between  (select max(partition_description) as max_value FROM information_schema.partitions  WHERE table_schema='${DB_NAME}' AND table_name='${TABLE_NAME}') and ${PAR_FUNC}(NOW() + INTERVAL ${ADD_UNITS} $RANGE_TYPE)
+where t.partition_name IS NULL AND ${PAR_FUNC}($expr_high) >  (select max(partition_description) as max_value FROM information_schema.partitions  WHERE table_schema='${DB_NAME}' AND table_name='${TABLE_NAME}' AND partition_description <>'MAXVALUE') and ($expr_high) >= ${PAR_FUNC}(NOW() + INTERVAL ${ADD_UNITS} $RANGE_TYPE)
 ORDER BY 1, 2, 3
 "
   fi
 #echo $QUERY_TO_GET_PARTITION_TO_ADD
 #GET_PARTITION_TO_ADD=`${MYSQL_HOME}/bin/mysql --user="${MYSQL_USER}" --password="${MYSQL_PASS}" --skip-column-names --batch --execute="${QUERY_TO_GET_PARTITION_TO_ADD}"`
 fi
+
+echo $QUERY_TO_GET_PARTITION_TO_ADD
+
 if [ $EXPIRE_UNITS ]; then
   echo "DROP Partition before $EXPIRE_UNITS $RANGE_TYPE(s)"
   QUERY_TO_GET_PARTITION_TO_DROP="
@@ -164,15 +173,23 @@ ON ${PAR_FUNC}($expr_high) = t.partition_description
   if [ ${PAR_FUNC^^} == 'QUOTE' ]; then
     QUERY_TO_GET_PARTITION_TO_DROP+="
 WHERE cal.date is null and str_to_date(t.partition_description,'\'%Y-%m-%d\'') < (SUBDATE(NOW(), INTERVAL ${EXPIRE_UNITS}-1 $RANGE_TYPE))
+AND PARTITION_NAME NOT IN ('pmax')
+AND t.partition_description not like '%${CUR_YM}%'
+AND t.partition_description not like '%${NEXT_YM}%'
 ORDER BY 1, 2, 3
+#LIMIT 1
 "
   else
     QUERY_TO_GET_PARTITION_TO_DROP+="
-WHERE cal.date is null and t.partition_description < ${PAR_FUNC}(SUBDATE(NOW(), INTERVAL ${EXPIRE_UNITS}-1 $RANGE_TYPE))
+WHERE cal.date is null and replace(t.partition_description,'''','') < ${PAR_FUNC}(SUBDATE(NOW(), INTERVAL ${EXPIRE_UNITS}-1 $RANGE_TYPE))
+AND PARTITION_NAME NOT IN ('pmax')
+AND t.partition_description not like '%${CUR_YM}%'
+AND t.partition_description not like '%${NEXT_YM}%'
 ORDER BY 1, 2, 3
+#LIMIT 1
 "
   fi
-#echo $QUERY_TO_GET_PARTITION_TO_DROP
+echo $QUERY_TO_GET_PARTITION_TO_DROP
 #GET_PARTITION_TO_DROP=`${MYSQL_HOME}/bin/mysql --user="${MYSQL_USER}" --password="${MYSQL_PASS}" --skip-column-names --batch --execute="${QUERY_TO_GET_PARTITION_TO_DROP}"`
 fi
 
@@ -186,17 +203,24 @@ ${MYSQL_HOME}/bin/mysql --user="${MYSQL_USER}" --password="${MYSQL_PASS}" --skip
 do
   results=($line)
   if [ ${results[0]} != "NULL" ] && [ ${results[2]} == "NULL" ];then
-	  echo "ADD PARTITION: ${results[0]}, ${results[1]}"
-	  QUERY_ADD_PARTITION="ALTER TABLE \`${DB_NAME}\`.\`${TABLE_NAME}\` ADD PARTITION (PARTITION ${results[0]} VALUES LESS THAN (${results[1]}))"
-	  echo $QUERY_ADD_PARTITION
-	  ${MYSQL_HOME}/bin/mysql --user="${MYSQL_USER}" --password="${MYSQL_PASS}" --execute="${QUERY_ADD_PARTITION}"
-          exit_if_error $? "Add partition query failed: <$?> $QUERY_ADD_PARTITION"
+          echo "ADD PARTITION: ${results[0]}, ${results[1]}"
+          #QUERY_ADD_PARTITION="ALTER TABLE \`${DB_NAME}\`.\`${TABLE_NAME}\` ADD PARTITION (PARTITION ${results[0]} VALUES LESS THAN ('${results[1]}'))"
+          QUERY_ADD_PARTITION="ALTER TABLE \`${DB_NAME}\`.\`${TABLE_NAME}\` REORGANIZE PARTITION pmax INTO (PARTITION ${results[0]} VALUES LESS THAN ('${results[1]}')  ,PARTITION pmax VALUES LESS THAN (MAXVALUE))"
+          echo $QUERY_ADD_PARTITION
+          if [ ${EXEC_MODE} == 'EXEC' ]; then
+              ${MYSQL_HOME}/bin/mysql --user="${MYSQL_USER}" --password="${MYSQL_PASS}" --execute="${QUERY_ADD_PARTITION}"
+              exit_if_error $? "Add partition query failed: <$?> $QUERY_ADD_PARTITION"
+              echo "EXECUTE COMPLETE"
+          fi
   elif [ ${results[0]} == "NULL" ] && [ ${results[2]} != "NULL" ];then
-	  echo "DROP PARTITION: ${results[2]}, ${results[3]}"
-	  QUERY_DROP_PARTITION="ALTER TABLE \`${DB_NAME}\`.\`${TABLE_NAME}\` DROP PARTITION ${results[2]}"
-	  echo $QUERY_DROP_PARTITION
-	  ${MYSQL_HOME}/bin/mysql --user="${MYSQL_USER}" --password="${MYSQL_PASS}" --execute="${QUERY_DROP_PARTITION}"
-	  exit_if_error $? "Drop partition query failed : <$?> $QUERY_DROP_PARTITION"
+          echo "DROP PARTITION: ${results[2]}, ${results[3]}"
+          QUERY_DROP_PARTITION="ALTER TABLE \`${DB_NAME}\`.\`${TABLE_NAME}\` DROP PARTITION ${results[2]}"
+          echo $QUERY_DROP_PARTITION
+          if [ ${EXEC_MODE} == 'EXEC' ]; then
+              ${MYSQL_HOME}/bin/mysql --user="${MYSQL_USER}" --password="${MYSQL_PASS}" --execute="${QUERY_DROP_PARTITION}"
+              exit_if_error $? "Drop partition query failed : <$?> $QUERY_DROP_PARTITION"
+              echo "EXECUTE COMPLETE"
+          fi
 
   fi
   #declare -p results
